@@ -1,3 +1,3 @@
 # seqfu2
 
-> Development recruitment
+> Development repository
