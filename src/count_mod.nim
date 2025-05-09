@@ -1,4 +1,4 @@
-import tables, strutils
+import tables, strutils, docopt, locks, sequtils
 from os import fileExists, dirExists
 import ./lib_filenames
 import ../readfx/readfx
@@ -29,6 +29,11 @@ type
     direction: string
     displayFilename: string
     count: int
+  
+  # Thread-safe data structure to store results
+  ThreadSafeData = object
+    lock: Lock
+    results: seq[CountResult]
 
 proc count_seqs(filename: string): int {.gcsafe.} =
   ## Count sequences in a FASTQ/FASTA file
@@ -73,15 +78,23 @@ Options:
     forwardTag = $args["--for-tag"]
     reverseTag = $args["--rev-tag"]
     multiqcFile = $args["--multiqc"]
-    threadCount = parseInt($args["--threads"])
+    threadCount = if parseInt($args["--threads"]) > 8: 8 else: parseInt($args["--threads"])
+  
+  if parseInt($args["--threads"]) > threadCount:
+    stderr.writeLine("WARNING: Thread count limited to ", threadCount)
   
   # Variables for storing input files and results
   var 
     inputFiles: seq[string]
     mqcReport = MULTIQC_HEADER
     errorCount = 0
-    countResults: seq[CountResult] = @[] # Store all file processing results
+    
+    # Initialize thread-safe data structure
+    sharedData: ThreadSafeData
     fileTable = initTable[string, Table[string, string]]() # Table to store the count information
+  
+  # Initialize the lock
+  initLock(sharedData.lock)
   
   # Handle file inputs - use stdin if no files provided
   if args["<inputfile>"].len() == 0:
@@ -99,7 +112,7 @@ Options:
   # Define the thread task explicitly to avoid undeclared identifier errors
   proc processFileTask(file: string, forTag, revTag: string, 
                       useAbsPath, useBasename: bool, 
-                      results: ptr seq[CountResult]) {.gcsafe.} =
+                      sharedPtr: ptr ThreadSafeData) {.gcsafe.} =
     # Skip if file doesn't exist
     if file != "-" and not fileExists(file):
       if dirExists(file):
@@ -132,8 +145,9 @@ Options:
       count: seqCount
     )
     
-    # Add to shared results
-    results[].add(result)
+    # Add to shared results using lock for thread safety
+    withLock(sharedPtr[].lock):
+      sharedPtr[].results.add(result)
   
   # Create Malebolgia master
   var m = createMaster()
@@ -149,12 +163,12 @@ Options:
       for i in startIdx ..< endIdx:
         # Spawn a task for each file in the current batch
         m.spawn processFileTask(inputFiles[i], forwardTag, reverseTag, 
-                              abspath, basename, addr countResults)
+                              abspath, basename, addr sharedData)
       
       batch += 1
   
   # Process the results and update the fileTable
-  for result in countResults:
+  for result in sharedData.results:
     if verbose:
       echo(result.filename & " (" & result.direction & "): " & $result.count)
     
@@ -174,7 +188,8 @@ Options:
     else:
       # Paired-end data (or forward-only)
       if "R2" in counts:
-        if counts["R1"] == counts["R2"]:
+        # Make sure both R1 and R2 exist before comparing
+        if "R1" in counts and counts["R1"] == counts["R2"]:
           # Forward and reverse have same count (good)
           echo counts["filename_R1"], "\t", counts["R1"], "\tPaired"
           mqcReport.add(counts["filename_R1"] & "\t" & counts["R1"] & "\tPE\n")
@@ -184,16 +199,27 @@ Options:
             echo counts["filename_R2"], "\t", counts["R2"], "\tPaired:R2"
             mqcReport.add(counts["filename_R2"] & "\t" & counts["R2"] & "\tPE (Reverse)\n")
         else:
-          # Error: paired files have different number of sequences
+          # Error: paired files have different number of sequences or missing R1
           errorCount += 1
-          stderr.writeLine("ERROR: Different counts in ", counts["filename_R1"], " and ", counts["filename_R2"])
-          stderr.writeLine("# ", counts["filename_R1"], ": ", counts["R1"])
-          stderr.writeLine("# ", counts["filename_R2"], ": ", counts["R2"])
-          mqcReport.add(counts["filename_R1"] & "\t" & counts["R1"] & "/" & counts["R2"] & "\tError\n")
-      else:
+          let r1count = if "R1" in counts: counts["R1"] else: "missing"
+          let r2count = counts["R2"]
+          stderr.writeLine("ERROR: Different counts in ", 
+                          (if "filename_R1" in counts: counts["filename_R1"] else: "missing R1"), 
+                          " and ", counts["filename_R2"])
+          stderr.writeLine("# R1: ", r1count)
+          stderr.writeLine("# R2: ", r2count)
+          mqcReport.add(counts["filename_R2"] & "\t" & r2count & "/error\tError\n")
+      elif "R1" in counts:
         # Forward-only data (no R2 found)
         echo counts["filename_R1"], "\t", counts["R1"], "\tSE"
         mqcReport.add(counts["filename_R1"] & "\t" & counts["R1"] & "\tSE\n")
+      else:
+        # Should never happen, but handle it gracefully
+        var dirList = ""
+        for dir in toSeq(counts.keys()):
+          if dirList.len > 0: dirList.add(", ")
+          dirList.add(dir)
+        stderr.writeLine("WARNING: Strange direction found for sample ", sampleId, ": ", dirList)
   
   # Save MultiQC report if requested
   if multiqcFile != "nil":
@@ -207,6 +233,9 @@ Options:
     except Exception:
       stderr.writeLine("Unable to write MultiQC report to ", multiqcFile, ": printing to STDOUT instead.")
       echo mqcReport
+
+  # Clean up the lock
+  deinitLock(sharedData.lock)
 
   # Return error count
   if errorCount > 0:
