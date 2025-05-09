@@ -1,0 +1,1 @@
+./data/fasta/multiline.fasta.gz	8	SE

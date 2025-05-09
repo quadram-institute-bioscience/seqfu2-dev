@@ -9,7 +9,8 @@ license     = "MIT"
 requires "nim >= 1.6.0", 
   "readfx#head",
   "docopt#v0.7.1",
-  "colorize"
+  "colorize",
+  "malebolgia"
 
 # Binaries
 srcDir = "src"

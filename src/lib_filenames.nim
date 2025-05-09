@@ -3,7 +3,7 @@
 ]#
 import strutils
 
-proc extractTag*(filename: string, patternFor: string, patternRev: string): (string, string) =
+proc extractTagFromFilename*(filename: string, patternFor: string, patternRev: string): (string, string) =
     ## Extracts basename and read tag (R1, R2, or SE) from sequencing filenames.
     ##
     ## Parameters:

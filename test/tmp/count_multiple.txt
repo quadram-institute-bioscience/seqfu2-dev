@@ -1,0 +1,2 @@
+./data/fasta/nanopore_tags.fasta	4	SE
+./data/fasta/nocomment.fasta.gz	10	SE

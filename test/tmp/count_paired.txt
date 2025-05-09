@@ -1,0 +1,1 @@
+./data/illumina/amplicon_R1.fastq.gz	50	Paired

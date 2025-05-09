@@ -1,0 +1,1 @@
+./data/fasta/nanopore_tags.fasta	4	SE

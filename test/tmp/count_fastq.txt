@@ -1,0 +1,1 @@
+./data/nanopore/nanopore.fastq.gz	10	SE

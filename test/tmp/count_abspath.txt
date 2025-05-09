@@ -1,0 +1,1 @@
+/Users/telatina/git/seqfu2-dev/data/fasta/nanopore_tags.fasta	4	SE
