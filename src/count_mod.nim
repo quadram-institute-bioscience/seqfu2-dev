@@ -3,6 +3,7 @@ from os import fileExists, dirExists
 import ./lib_filenames
 import ../readfx/readfx
 import malebolgia
+
 # Default MultiQC header template for sequence count reports
 const MULTIQC_HEADER = """# plot_type: 'table'
 # section_name: 'SeqFu counts'
@@ -20,7 +21,16 @@ const MULTIQC_HEADER = """# plot_type: 'table'
 Sample	col1	col2
 """
 
-proc count_seqs*(filename: string): int =
+# Data structure to hold sequence count results
+type
+  CountResult = object
+    filename: string
+    sampleId: string
+    direction: string
+    displayFilename: string
+    count: int
+
+proc count_seqs(filename: string): int {.gcsafe.} =
   ## Count sequences in a FASTQ/FASTA file
   ## Args:
   ##   filename: Path to the sequence file (or "-" for stdin)
@@ -32,7 +42,9 @@ proc count_seqs*(filename: string): int =
   return result
 
 proc fastx_count*(argv: var seq[string]): int =
-  ## Main function to count sequences in FASTQ/FASTA files
+  ## Main function to count sequences in FASTQ/FASTA files using parallel processing
+  ## For proper compilation:
+  ##   nim c -d:ThreadPoolSize=N -d:FixedChanSize=16 --threads:on yourfile.nim
   ## Returns: error count (0 if successful)
   
   # Parse command line arguments using docopt
@@ -46,6 +58,7 @@ Options:
   -f, --for-tag R1       Forward string, like _R1 [default: auto]
   -r, --rev-tag R2       Reverse string, like _R2 [default: auto]
   -m, --multiqc FILE     Save report in MultiQC format
+  -t, --threads INT      Maximum threads to use [default: 4]
   -v, --verbose          Verbose output
   -h, --help             Show this help
 
@@ -60,15 +73,15 @@ Options:
     forwardTag = $args["--for-tag"]
     reverseTag = $args["--rev-tag"]
     multiqcFile = $args["--multiqc"]
+    threadCount = parseInt($args["--threads"])
   
+  # Variables for storing input files and results
   var 
     inputFiles: seq[string]
     mqcReport = MULTIQC_HEADER
     errorCount = 0
-    
-  # NOTE: For multi-threaded implementation, we could declare:
-  # countResults = newTable[string, FlowVar[int]]() 
-  # This would store thread handles for each counting operation
+    countResults: seq[CountResult] = @[] # Store all file processing results
+    fileTable = initTable[string, Table[string, string]]() # Table to store the count information
   
   # Handle file inputs - use stdin if no files provided
   if args["<inputfile>"].len() == 0:
@@ -79,59 +92,78 @@ Options:
     for file in args["<inputfile>"]:
       inputFiles.add(file)
 
-  # Table to store sequence counts per sample: sampleID -> {direction -> count}
-  var fileTable = initTable[string, Table[string, string]]()
+  # Process files using Malebolgia for parallel execution
+  if verbose:
+    stderr.writeLine("Processing files using up to ", threadCount, " threads")
   
-  # Process each input file
-  for filename in sorted(inputFiles):
+  # Define the thread task explicitly to avoid undeclared identifier errors
+  proc processFileTask(file: string, forTag, revTag: string, 
+                      useAbsPath, useBasename: bool, 
+                      results: ptr seq[CountResult]) {.gcsafe.} =
     # Skip if file doesn't exist
-    if filename != "-" and not fileExists(filename):
-      if dirExists(filename):
-        stderr.writeLine("WARNING: Directories are not supported. Skipping ", filename)
+    if file != "-" and not fileExists(file):
+      if dirExists(file):
+        stderr.writeLine("WARNING: Directories are not supported. Skipping ", file)
       else:
-        stderr.writeLine("WARNING: File ", filename, " not found.")
-      continue
+        stderr.writeLine("WARNING: File ", file, " not found.")
+      return
     
     # Extract filename components
     let
-      (_, filenameNoExt, extension) = splitFile(filename)
-      # Extract sample ID and direction (R1, R2, or SE) from filename
-      (sampleId, direction) = extractTagFromFilename(filenameNoExt, forwardTag, reverseTag)
+      (_, filenameNoExt, extension) = splitFile(file)
+      (sampleId, direction) = extractTagFromFilename(filenameNoExt, forTag, revTag)
     
     # Determine how filename should be displayed based on options
-    var displayFilename = filename
-    if abspath:
-      displayFilename = absolutePath(filename)
-    elif basename:
+    var displayFilename = file
+    if useAbsPath:
+      displayFilename = absolutePath(file)
+    elif useBasename:
       displayFilename = filenameNoExt & extension
 
-    # ===============================================================
-    # For multi-threaded implementation, replace this section with:
-    # ===============================================================
-    # # Start a new thread to count sequences
-    # if not (sampleId in countResults):
-    #   countResults[sampleId] = newTable[string, FlowVar[int]]()
-    # countResults[sampleId][direction] = spawn count_seqs(filename)
-    # ===============================================================
+    # Count sequences in the file
+    let seqCount = count_seqs(file)
     
-    # Count sequences in the file using the isolated counting procedure
-    let seqCount = count_seqs(filename)
+    # Create result object
+    var result = CountResult(
+      filename: file,
+      sampleId: sampleId,
+      direction: direction,
+      displayFilename: displayFilename,
+      count: seqCount
+    )
     
+    # Add to shared results
+    results[].add(result)
+  
+  # Create Malebolgia master
+  var m = createMaster()
+  
+  # Process files in parallel with controlled concurrency
+  m.awaitAll:
+    var batch = 0
+    while batch * threadCount < inputFiles.len:
+      # Process up to threadCount files in each batch
+      let startIdx = batch * threadCount
+      let endIdx = min(startIdx + threadCount, inputFiles.len)
+      
+      for i in startIdx ..< endIdx:
+        # Spawn a task for each file in the current batch
+        m.spawn processFileTask(inputFiles[i], forwardTag, reverseTag, 
+                              abspath, basename, addr countResults)
+      
+      batch += 1
+  
+  # Process the results and update the fileTable
+  for result in countResults:
     if verbose:
-      echo(filename & " (" & direction & "): " & $seqCount)
+      echo(result.filename & " (" & result.direction & "): " & $result.count)
     
     # Store count information
-    if not (sampleId in fileTable):
-      fileTable[sampleId] = initTable[string, string]()
+    if not (result.sampleId in fileTable):
+      fileTable[result.sampleId] = initTable[string, string]()
     
-    fileTable[sampleId][direction] = $seqCount
-    fileTable[sampleId]["filename_" & direction] = displayFilename
-    
-    # ===============================================================
-    # For multi-threaded implementation, we would wait and collect 
-    # results after all spawns have been started, using ^() operator
-    # to get values from FlowVar objects
-    # ===============================================================
+    fileTable[result.sampleId][result.direction] = $result.count
+    fileTable[result.sampleId]["filename_" & result.direction] = result.displayFilename
   
   # Output results and build MultiQC report
   for sampleId, counts in fileTable:
